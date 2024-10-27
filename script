@@ -1,0 +1,224 @@
+#!/bin/bash
+echo "Скрипт по автоматическому развертыванию кластера K8S из трёх нод"
+read -p "Введите FQDN/IP-адрес Load-Balancer-сервера: " LB
+read -p "Введите FQDN/IP-адрес Worker-ноды: " WORKER
+read -p "Введите FQDN/IP-адрес Master-ноды: " MASTER
+read -p "Введите рутовую учетку, из-под которой будет происходить настройка на удаленных хоста: " USERNAME
+read -s -p "Введите пароль: " PASSWORD
+echo ""
+#Первый этап - настройка операционной системы удаленных хостов
+#ОТключение SWAP на удаленных воркере и мастере
+###
+if ! command -v sshpass &> /dev/null; then
+sudo yum install -y sshpass
+fi
+###
+echo ""
+echo "ОТКЛЮЧЕНИЕ SWAP-ФАЙЛОВ НА ВОРКЕРЕ И МАСТЕРЕ"
+for HOST  in $WORKER $MASTER; do
+sshpass -p "$PASSWORD" ssh $USERNAME@"$HOST" << EOF
+        sudo swapoff -a
+        SWAP_LINE=\$(grep -n 'swap' /etc/fstab | cut -d: -f1)
+        if [ -n "\$SWAP_LINE" ]; then
+                echo "\$PASSWORD" | sudo -S sed -i "\${SWAP_LINE}s/^/#/" /etc/fstab
+        fi
+EOF
+echo "SWAP НА ХОСТЕ $HOST ОТКЛЮЧЕН"
+done
+#
+echo "ОТКЛЮЧЕНИЕ SWAP ----> OK"
+###
+echo ""
+#Установка имени хостов
+echo "НАСТРОЙКА СИСТЕМНЫХ ИМЕН ХОСТОВ"
+sshpass -p "$PASSWORD" ssh $USERNAME@"$HOST" << EOF
+        sudo hostnamectl set-hostname worker1
+EOF
+echo "СИСТЕМНОЕ ИМЯ ИЗМЕНЕНО: $WORKER ----> worker1"
+sshpass -p "$PASSWORD" ssh $USERNAME@"$MASTER" << EOF
+        sudo hostnamectl set-hostname master1
+EOF
+echo "СИСТЕМНОЕ ИМЯ ИЗМЕНЕНО: $MASTER ----> master1"
+sshpass -p "$PASSWORD" ssh $USERNAME@"$LB" << EOF
+        sudo hostnamectl set-hostname load-balancer
+EOF
+echo "СИСТЕМНОЕ ИМЯ ИЗМЕНЕНО: $LB ----> load-balancer"
+echo "НАСТРОЙКА СИСТЕМНЫХ ИМЕН ХОСТОВ ----> ОК"
+###
+#Установка пакетов
+echo ""
+echo "УСТАНОВКА ПАКЕТОВ"
+for HOST in $MASTER $WORKER; do
+sshpass -p "$PASSWORD" ssh $USERNAME@"$HOST" << EOF
+        if ! command -v ebtables  &> /dev/null; then
+                sudo yum install -y ebtables
+        fi
+        if ! command -v cri-o  &> /dev/null; then
+                sudo yum install -y cri-o
+        fi
+        if ! command -v kubelet  &> /dev/null; then
+                sudo yum install -y kubelet
+        fi
+        if ! command -v kubeadm  &> /dev/null; then
+                sudo yum install -y kubeadm
+        fi
+        if ! command -v kubectl  &> /dev/null; then
+                sudo yum install -y ebtables
+        fi
+        sudo systemctl enable --now crio kubelet
+EOF
+echo "ПАКЕТ EBTABLES УСТАНОВЛЕН НА $HOST"
+done
+echo "УСТАНОВКА ПАКЕТОВ ----> OK"
+###
+#Установка модулей ядра
+echo ""
+echo "ПОДКЛЮЧЕНИЕ МОДУЛЕЙ ЯДРА ОПЕРАЦИОННЫЙ СИСТЕМЫ"
+for HOST in $MASTER $WORKER; do
+sshpass -p "$PASSWORD" ssh $USERNAME@"$WORKER" << EOF
+        echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf
+        if grep -q "hfsplus" /etc/modprobe.d/deny_fs.conf; then
+                sudo sed -i 's/^\(.*hfsplus.*\)/#\1/' /etc/modprobe.d/deny_fs.conf
+        fi
+        sudo modprobe overlay
+        sudo modprobe br_netfilter
+EOF
+echo "МОДУЛИ ЯДРА ПОДКЛЮЧЕНЫ НА $HOST"
+done
+echo "ПОДКЛЮЧЕНИЕ МОДУЛЕЙ ЯДРА ОПЕРАЦИОННЫЙ СИСТЕМЫ ---> OK"
+###
+#Установка системных переменных на воркере и мастере
+echo "УСТАНОВКА СИСТЕМНЫХ ПЕРЕМЕННЫХ"
+for HOST in $WORKER $MASTER; do
+sshpass -p "$PASSWORD" ssh $USERNAME@"$WORKER" << EOF
+        echo -e "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/k8s.conf
+        if [[ -f /etc/sysctl.d/network_tune.conf ]]; then
+                sudo sed -i '/^net\.ipv4\.ip_forward/s/^/#/' /etc/sysctl.d/network_tune.conf
+        fi
+        sudo sysctl --system
+EOF
+echo "СИСТЕМНЫЕ ПЕРЕМЕННЫЕ НАСТРОЕНЫ НА $HOST"
+done
+echo "НАСТРОЙКА СИСТЕМНЫХ ПЕРЕМЕННЫХ ----> OK"
+###
+#ВКЛЮЧЕНИЕ МОДУЛЯ IPv6 НА КЛАСТЕРАХ
+echo "ВКЛЮЧЕНИЕ МОДУЛЯ IPv6 НА ХОСТАХ"
+for HOST in $WORKER $MASTER; do
+sshpass -p "$PASSWORD" ssh $USERNAME@"$WORKER" << EOF
+        if [[ -f /etc/default/grub ]]; then
+                sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\) ipv6.disable=1/\1/' /etc/default/grub
+        fi
+        sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+EOF
+echo "МОДУЛЬ IPv6 ВКЛЮЧЕН НА ХОСТЕ $HOST"
+done
+echo "ВКЛЮЧЕНИЕ МОДУЛЯ IPv6 НА ХОСТАХ ----> OK"
+echo ""
+###
+#НАСТРОЙКА LOAD-BALANCER
+echo "НАСТРОЙКА LOAD-BALANCER"
+LB_CONF=$(cat <<EOF
+# For more information on configuration, see:
+#   * Official English Documentation: http://nginx.org/en/docs/
+#   * Official Russian Documentation: http://nginx.org/ru/docs/
+
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+
+# Load dynamic modules. See /usr/share/doc/nginx/README.dynamic.
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format  main  '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                      '\$status \$body_bytes_sent "\$http_referer" '
+                      '"\$http_user_agent" "\$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile            on;
+    tcp_nopush          on;
+    tcp_nodelay         on;
+    keepalive_timeout   65;
+    types_hash_max_size 2048;
+
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+
+    # Load modular configuration files from the /etc/nginx/conf.d directory.
+    # See http://nginx.org/en/docs/ngx_core_module.html#include
+    # for more information.
+    include /etc/nginx/conf.d/*.conf;
+
+    server {
+        listen       80 default_server;
+        server_name  _;
+        root         /usr/share/nginx/html;
+
+        # Load configuration files for the default server block.
+        include /etc/nginx/default.d/*.conf;
+
+        location / {
+        }
+
+        error_page 404 /404.html;
+            location = /40x.html {
+        }
+
+        error_page 500 502 503 504 /50x.html;
+            location = /50x.html {
+        }
+    }
+
+# Settings for a TLS enabled server.
+#
+#    server {
+#        listen       443 ssl http2 default_server;
+#        server_name  _;
+#        root         /usr/share/nginx/html;
+#
+#        ssl_certificate "/etc/pki/nginx/server.crt";
+#        ssl_certificate_key "/etc/pki/nginx/private/server.key";
+#        ssl_session_cache shared:SSL:1m;
+#        ssl_session_timeout  10m;
+#        ssl_ciphers PROFILE=SYSTEM;
+#        ssl_prefer_server_ciphers on;
+#
+#        # Load configuration files for the default server block.
+#        include /etc/nginx/default.d/*.conf;
+#
+#        location / {
+#        }
+#
+#        error_page 404 /404.html;
+#            location = /40x.html {
+#        }
+#
+#        error_page 500 502 503 504 /50x.html;
+#            location = /50x.html {
+#        }
+#    }
+
+}
+
+stream {
+upstream stream_backend {
+    least_conn;
+        server $(dig +short $MASTER):6443;
+        }
+
+server {
+    listen 6443;
+    proxy_pass stream_backend;
+  }
+}
+EOF
+)
+sshpass -p "$PASSWORD" ssh $USERNAME@"$LB" << EOF
+        echo "$LB_CONF" | sudo tee /etc/nginx/nginx.conf
+EOF
